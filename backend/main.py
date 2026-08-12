@@ -42,7 +42,7 @@ class SearchRequest(BaseModel):
     location: str = Field(..., min_length=1, description='State/province or city, e.g. "Texas" or "Newark, Trenton"')
     country: str = Field(default="US", description="US, CA, UK, AU, or IE")
     max_pages: int = Field(default=50, ge=1, le=500)
-    personal_only: bool = Field(default=False, description="If true, only keep personal emails and drop generic ones (info@, office@, etc.). Default is False to capture all valid emails.")
+    personal_only: bool = Field(default=True, description="If true, keep only personal emails on free providers (gmail/yahoo/outlook/etc.) and drop generic ones (info@, office@) and company-domain emails.")
 
 
 @app.post("/api/contacts/search")

@@ -45,7 +45,7 @@ function SearchForm({ onStart, onBulkStart, busy }) {
   const [location, setLocation]           = useState('');
   const [country, setCountry]             = useState('US');
   const [maxPages, setMaxPages]           = useState(50);
-  const [personalOnly, setPersonalOnly]   = useState(false);
+  const [personalOnly, setPersonalOnly]   = useState(true);
   const [bulkMode, setBulkMode]           = useState(false);
   const [bulkText, setBulkText]           = useState('');
 
@@ -130,7 +130,7 @@ function SearchForm({ onStart, onBulkStart, busy }) {
                 Filter
                 <label className="toggle-inner" htmlFor="input-personal-only-bulk">
                   <input id="input-personal-only-bulk" type="checkbox" checked={personalOnly} onChange={(e) => setPersonalOnly(e.target.checked)} />
-                  <span className="toggle-label-text">Personal only</span>
+                  <span className="toggle-label-text">Personal only (Gmail/Yahoo)</span>
                 </label>
               </div>
               <div style={{ display: 'flex', alignItems: 'end' }}>
@@ -167,10 +167,10 @@ function SearchForm({ onStart, onBulkStart, busy }) {
             </label>
             <div className="toggle-wrap">
               Email Filter
-              <label className="toggle-inner" htmlFor="input-personal-only">
-                <input id="input-personal-only" type="checkbox" checked={personalOnly} onChange={(e) => setPersonalOnly(e.target.checked)} />
-                <span className="toggle-label-text">Personal only</span>
-              </label>
+                <label className="toggle-inner" htmlFor="input-personal-only">
+                  <input id="input-personal-only" type="checkbox" checked={personalOnly} onChange={(e) => setPersonalOnly(e.target.checked)} />
+                  <span className="toggle-label-text">Personal only (Gmail/Yahoo)</span>
+                </label>
             </div>
             <div style={{ display: 'flex', alignItems: 'end' }}>
               <button type="submit" disabled={busy} id="btn-search" className="btn btn-primary" style={{ width: '100%' }}>
@@ -277,15 +277,30 @@ export default function App() {
   // ── single search ──
   const startSearch = async (payload) => {
     setError(null);
+    clearInterval(pollRef.current);
+    pollRef.current = null;
+    // Show "searching" immediately. On Vercel the backend runs the whole
+    // search before answering (up to ~60s), so without this the UI would sit
+    // with no feedback at all; locally it also makes the UI respond instantly.
+    setActive({
+      search_id: null,
+      role: payload.role,
+      location: payload.location,
+      status: 'running',
+      pages_checked: 0,
+      emails_found: 0,
+      contacts: [],
+    });
     try {
       const res  = await fetch(`${API_URL}/api/contacts/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
+      const data = await res.json().catch(() => null);
+      if (!data || data.error) {
+        setError((data && data.error) || `Could not start search (HTTP ${res.status})`);
+        setActive((prev) => (prev && prev.search_id === null ? { ...prev, status: 'failed' } : prev));
         return;
       }
       if (data.contacts) {
@@ -293,22 +308,14 @@ export default function App() {
         refreshHistory();
         return;
       }
-      // Set optimistic active state immediately so UI updates without needing a refresh
-      setActive({
-        search_id: data.search_id,
-        role: payload.role,
-        location: payload.location,
-        status: data.status || 'running',
-        pages_checked: 0,
-        emails_found: 0,
-        contacts: [],
-      });
+      // Local async mode: poll the background search.
       refreshHistory();
       clearInterval(pollRef.current);
       pollRef.current = setInterval(() => loadActive(data.search_id), 1500);
       loadActive(data.search_id);
     } catch {
       setError('Could not start search');
+      setActive((prev) => (prev && prev.search_id === null ? { ...prev, status: 'failed' } : prev));
     }
   };
 

@@ -741,13 +741,17 @@ def update_search(search_id: str, pages_checked: int = None, emails_found: int =
     conn.close()
 
 
-def save_contacts(search_id: str, validated: list[dict], source_map: dict, personal_only: bool = False):
+def save_contacts(search_id: str, validated: list[dict], source_map: dict, personal_only: bool = True):
     conn = get_conn()
     for v in validated:
         if not v.get("valid"):
             continue
-        if personal_only and v.get("status") == "generic":
-            continue
+        if personal_only:
+            # Keep only real personal inboxes on free providers (gmail/yahoo/outlook/etc.),
+            # dropping role mailboxes (info@, office@) and name@company.com addresses.
+            domain = v["email"].partition("@")[2].lower()
+            if v.get("status") == "generic" or domain not in PERSONAL_DOMAINS:
+                continue
         existing_this = conn.execute(
             "SELECT id FROM contacts WHERE search_id = ? AND email = ?", (search_id, v["email"])
         ).fetchone()
