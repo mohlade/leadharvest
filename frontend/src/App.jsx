@@ -284,13 +284,28 @@ export default function App() {
         body: JSON.stringify(payload),
       });
       const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+        return;
+      }
       if (data.contacts) {
         setActive(data);
         refreshHistory();
         return;
       }
+      // Set optimistic active state immediately so UI updates without needing a refresh
+      setActive({
+        search_id: data.search_id,
+        role: payload.role,
+        location: payload.location,
+        status: data.status || 'running',
+        pages_checked: 0,
+        emails_found: 0,
+        contacts: [],
+      });
+      refreshHistory();
       clearInterval(pollRef.current);
-      pollRef.current = setInterval(() => loadActive(data.search_id), 2000);
+      pollRef.current = setInterval(() => loadActive(data.search_id), 1500);
       loadActive(data.search_id);
     } catch {
       setError('Could not start search');
