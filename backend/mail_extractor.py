@@ -215,8 +215,8 @@ def extract_emails(html: str) -> list[str]:
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
         if href.lower().startswith("mailto:"):
-            candidate = normalize_email(href[len("mailto:"):].split("?", 1)[0])
-            if candidate and is_plausible(candidate):
+            candidate = candidate_email(href[len("mailto:"):].split("?", 1)[0])
+            if candidate:
                 emails.add(candidate)
 
     for match in CFEMAIL_RE.findall(html):
