@@ -40,6 +40,72 @@ function Confidence({ value }) {
 
 // ─── Search Form ──────────────────────────────────────────────────────────────
 
+// Stream a search with live progress over SSE. Resolves with the final
+// `complete` event, or with the plain JSON body if the server did not stream
+// (buffering proxy / older backend), or null if the stream ended unexpectedly.
+async function streamSearch(payload, onEvent) {
+  const res = await fetch(`${API_URL}/api/contacts/search?stream=1`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const ctype = res.headers.get('content-type') || '';
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+  if (!res.body || !ctype.includes('text/event-stream')) {
+    return res.json().catch(() => null);
+  }
+  return await new Promise((resolve, reject) => {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) !== -1) {
+            const chunk = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const line = chunk.split('\n').find((l) => l.startsWith('data: '));
+            if (!line) continue;
+            let evt;
+            try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+            if (onEvent) onEvent(evt);
+            if (evt.event === 'complete') { resolve(evt); return; }
+          }
+        }
+        resolve(null);
+      } catch (e) { reject(e); }
+    })();
+  });
+}
+
+// Poll a search until it reaches a final state. Used only as a fallback when
+// the server answers with plain JSON instead of streaming.
+function waitForDone(searchId, onUpdate) {
+  return new Promise((resolve) => {
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch(`${API_URL}/api/contacts/search/${searchId}`);
+        const d = await r.json();
+        if (onUpdate) onUpdate(d);
+        if (d.status === 'done' || d.status === 'failed' || d.status === 'stopped') {
+          clearInterval(iv);
+          resolve(d);
+        }
+      } catch {
+        clearInterval(iv);
+        resolve(null);
+      }
+    }, 2000);
+  });
+}
+
 function SearchForm({ onStart, onBulkStart, busy }) {
   const [role, setRole]                   = useState('');
   const [location, setLocation]           = useState('');
@@ -279,9 +345,9 @@ export default function App() {
     setError(null);
     clearInterval(pollRef.current);
     pollRef.current = null;
-    // Show "searching" immediately. On Vercel the backend runs the whole
-    // search before answering (up to ~60s), so without this the UI would sit
-    // with no feedback at all; locally it also makes the UI respond instantly.
+    // Show "searching" immediately with live counts filling in as the backend
+    // streams progress (previously the UI sat at 0/0 until the whole search
+    // finished, which looked broken).
     setActive({
       search_id: null,
       role: payload.role,
@@ -289,32 +355,49 @@ export default function App() {
       status: 'running',
       pages_checked: 0,
       emails_found: 0,
+      message: null,
       contacts: [],
     });
     try {
-      const res  = await fetch(`${API_URL}/api/contacts/search`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      const result = await streamSearch(payload, (evt) => {
+        if (evt.event === 'start' && evt.search_id) {
+          setActive((prev) => ({ ...prev, search_id: evt.search_id, max_pages: evt.max_pages }));
+        } else if (evt.event === 'progress') {
+          setActive((prev) => ({
+            ...prev,
+            status: evt.status || prev.status,
+            pages_checked: evt.pages_checked ?? prev.pages_checked,
+            emails_found: evt.emails_found ?? prev.emails_found,
+            message: evt.message ?? prev.message,
+          }));
+        }
       });
-      const data = await res.json().catch(() => null);
-      if (!data || data.error) {
-        setError((data && data.error) || `Could not start search (HTTP ${res.status})`);
-        setActive((prev) => (prev && prev.search_id === null ? { ...prev, status: 'failed' } : prev));
-        return;
-      }
-      if (data.contacts) {
-        setActive(data);
+
+      // Streamed to completion — show results immediately.
+      if (result && result.event === 'complete') {
+        setActive(result);
         refreshHistory();
         return;
       }
-      // Local async mode: poll the background search.
-      refreshHistory();
-      clearInterval(pollRef.current);
-      pollRef.current = setInterval(() => loadActive(data.search_id), 1500);
-      loadActive(data.search_id);
-    } catch {
-      setError('Could not start search');
+
+      // Fallback: plain JSON response (sync mode / buffered proxy).
+      if (result && result.search_id) {
+        if (result.contacts) {
+          setActive(result);
+          refreshHistory();
+          return;
+        }
+        refreshHistory();
+        clearInterval(pollRef.current);
+        pollRef.current = setInterval(() => loadActive(result.search_id), 1500);
+        loadActive(result.search_id);
+        return;
+      }
+
+      setError((result && result.error) || 'Could not start search');
+      setActive((prev) => (prev && prev.search_id === null ? { ...prev, status: 'failed' } : prev));
+    } catch (e) {
+      setError(e.message || 'Could not start search');
       setActive((prev) => (prev && prev.search_id === null ? { ...prev, status: 'failed' } : prev));
     }
   };
@@ -331,47 +414,50 @@ export default function App() {
       bulkRef.current = bulkRef.current.map((q, idx) => idx === i ? { ...q, status: 'running' } : q);
       setBulkQueue([...bulkRef.current]);
 
+      let final = null;
       try {
-        const res  = await fetch(`${API_URL}/api/contacts/search`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payloads[i]),
-        });
-        const startData = await res.json();
-        const sid = startData.search_id;
-
-        if (startData.contacts) {
+        final = await streamSearch(payloads[i], (evt) => {
+          if (!evt.search_id && !evt.emails_found) return;
           bulkRef.current = bulkRef.current.map((q, idx) =>
-            idx === i ? { ...q, status: startData.status, emails_found: startData.emails_found, search_id: sid } : q
+            idx === i
+              ? {
+                  ...q,
+                  search_id: evt.search_id || q.search_id,
+                  status: evt.status && evt.status !== 'running' ? evt.status : q.status,
+                  emails_found: evt.emails_found ?? q.emails_found,
+                }
+              : q
           );
           setBulkQueue([...bulkRef.current]);
-          continue;
-        }
+        });
 
-        // poll until done
-        await new Promise((resolve) => {
-          const iv = setInterval(async () => {
-            try {
-              const r = await fetch(`${API_URL}/api/contacts/search/${sid}`);
-              const d = await r.json();
+        // Fallback for non-streaming responses: poll until done.
+        if (!final || (final.status === 'running' && !final.contacts)) {
+          const sid = final?.search_id || bulkRef.current[i]?.search_id;
+          if (sid) {
+            final = await waitForDone(sid, (d) => {
               bulkRef.current = bulkRef.current.map((q, idx) =>
-                idx === i ? { ...q, status: d.status, emails_found: d.emails_found, search_id: sid } : q
+                idx === i ? { ...q, status: d.status, emails_found: d.emails_found } : q
               );
               setBulkQueue([...bulkRef.current]);
-              if (d.status === 'done' || d.status === 'failed' || d.status === 'stopped') {
-                clearInterval(iv);
-                resolve();
-              }
-            } catch {
-              clearInterval(iv);
-              resolve();
-            }
-          }, 2500);
-        });
+            }) || final;
+          }
+        }
       } catch {
-        bulkRef.current = bulkRef.current.map((q, idx) => idx === i ? { ...q, status: 'failed' } : q);
-        setBulkQueue([...bulkRef.current]);
+        final = null;
       }
+
+      bulkRef.current = bulkRef.current.map((q, idx) =>
+        idx === i
+          ? {
+              ...q,
+              status: final && final.status ? final.status : 'failed',
+              emails_found: final?.emails_found ?? final?.contacts?.length ?? q.emails_found,
+              search_id: final?.search_id || q.search_id,
+            }
+          : q
+      );
+      setBulkQueue([...bulkRef.current]);
     }
     refreshHistory();
   };
@@ -449,7 +535,14 @@ export default function App() {
 
           {busy && active.status === 'running' && (
             <div className="progress-wrap">
-              <div className="progress-fill" style={{ width: '100%' }} />
+              <div
+                className="progress-fill"
+                style={{
+                  width: active.max_pages
+                    ? `${Math.min(100, Math.round(((active.pages_checked || 0) / active.max_pages) * 100))}%`
+                    : '100%',
+                }}
+              />
             </div>
           )}
 

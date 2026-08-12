@@ -1,6 +1,8 @@
 import csv
 import io
+import json
 import os
+import queue
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -8,7 +10,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -47,9 +49,12 @@ class SearchRequest(BaseModel):
 
 
 @app.post("/api/contacts/search")
-def start_search(req: SearchRequest):
+def start_search(req: SearchRequest, stream: int = Query(default=0)):
     search_id = uuid.uuid4().hex
     init_search(search_id, req.role.strip(), req.location.strip())
+
+    if stream:
+        return _stream_search(search_id, req)
 
     if os.getenv("VERCEL"):
         # On Vercel serverless the whole search runs synchronously inside this one
@@ -93,6 +98,92 @@ def start_search(req: SearchRequest):
     )
     thread.start()
     return {"search_id": search_id, "status": "running"}
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _stream_search(search_id: str, req: SearchRequest) -> StreamingResponse:
+    """Run the search and stream live progress as Server-Sent Events.
+
+    The search still executes inside a single function invocation (so it works
+    on serverless too), but progress pages_checked/emails_found/message are
+    pushed to the client as they happen instead of appearing only at the end.
+    """
+    q: "queue.Queue" = queue.Queue()
+
+    def _run_in_thread():
+        try:
+            run_search(
+                search_id,
+                req.role.strip(),
+                req.location.strip(),
+                req.country,
+                req.max_pages,
+                req.personal_only,
+                time_budget=int(os.getenv("SEARCH_TIME_BUDGET", "240")) if os.getenv("VERCEL") else None,
+                on_state=lambda **kw: q.put(kw),
+            )
+        finally:
+            q.put({"event": "done"})
+
+    thread = threading.Thread(target=_run_in_thread, daemon=True)
+    thread.start()
+
+    snapshot = {"status": "running", "pages_checked": 0, "emails_found": 0, "message": None}
+
+    def gen():
+        yield _sse(
+            {
+                "event": "start",
+                "search_id": search_id,
+                "role": req.role.strip(),
+                "location": req.location.strip(),
+                "status": "running",
+                "pages_checked": 0,
+                "emails_found": 0,
+                "max_pages": req.max_pages,
+            }
+        )
+        while True:
+            try:
+                item = q.get(timeout=15.0)
+            except queue.Empty:
+                if not thread.is_alive():
+                    break
+                yield ": keep-alive\n\n"
+                continue
+            if item.get("event") == "done":
+                break
+            snapshot.update({k: v for k, v in item.items() if v is not None})
+            yield _sse({"event": "progress", **snapshot})
+
+        conn = get_conn()
+        search = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM contacts WHERE search_id = ? ORDER BY confidence DESC", (search_id,)
+        ).fetchall()
+        conn.close()
+        yield _sse(
+            {
+                "event": "complete",
+                "search_id": search_id,
+                "role": req.role.strip(),
+                "location": req.location.strip(),
+                "status": search["status"] if search else "done",
+                "pages_checked": search["pages_checked"] if search else 0,
+                "emails_found": search["emails_found"] if search else len(rows),
+                "message": search["message"] if search else None,
+                "contacts": [dict(r) for r in rows],
+            }
+        )
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/contacts/search/{search_id}/stop")

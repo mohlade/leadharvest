@@ -1,6 +1,5 @@
 import os
 import sqlite3
-import threading
 from pathlib import Path
 
 def get_db_path() -> Path:
@@ -19,54 +18,66 @@ def get_db_path() -> Path:
 # unlike /tmp/jobs.db, which is wiped constantly.
 # The wrapper below mirrors the sqlite3 API used by the app, so none of the
 # SQL in main.py / mail_extractor.py needs to change.
+# A fresh connection is opened per get_conn() (like sqlite3.connect). Long-lived
+# cached connections get reaped by Turso mid-search ("stream not found"),
+# so we never cache one.
 # --------------------------------------------------------------------------
-
-_turso_local = threading.local()
-
-
-def _turso_client():
-    client = getattr(_turso_local, "client", None)
-    if client is None:
-        from libsql_client import create_client_sync
-
-        client = create_client_sync(
-            url=os.getenv("DATABASE_URL", "").strip(),
-            auth_token=os.getenv("TURSO_AUTH_TOKEN", "").strip() or None,
-        )
-        _turso_local.client = client
-    return client
 
 
 class _TursoCursor:
-    def __init__(self, result_set):
-        if result_set is None:
-            self._rows = []
-            return
-        self._rows = [dict(zip(result_set.columns, row)) for row in result_set.rows]
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self._rows = None
+
+    def _cols(self):
+        return [c[0] for c in (self._cursor.description or [])]
+
+    def _load(self):
+        if self._rows is None:
+            rows = self._cursor.fetchall()
+            self._rows = rows if rows is not None else []
+            self._cols_cache = self._cols()
+        return self._cols_cache
 
     def fetchone(self):
-        return self._rows.pop(0) if self._rows else None
+        cols = self._load()
+        if not self._rows:
+            return None
+        return dict(zip(cols, self._rows.pop(0)))
 
     def fetchall(self):
+        cols = self._load()
         rows, self._rows = self._rows, []
-        return rows
+        return [dict(zip(cols, r)) for r in rows]
 
 
 class _TursoConn:
-    """Drop-in sqlite3.Connection for Turso. Statements are autocommitted."""
+    """Drop-in sqlite3.Connection backed by a Turso connection."""
+
+    def __init__(self):
+        import libsql_experimental as lxsql
+
+        self._conn = lxsql.connect(
+            os.getenv("DATABASE_URL", "").strip(),
+            auth_token=os.getenv("TURSO_AUTH_TOKEN", "").strip() or None,
+        )
 
     def execute(self, sql, args=None):
-        return _TursoCursor(_turso_client().execute(sql, args))
+        if args is not None and not isinstance(args, tuple):
+            args = tuple(args)
+        return _TursoCursor(self._conn.execute(sql, args if args is not None else ()))
 
     def executescript(self, script):
-        stmts = [s.strip() for s in script.split(";") if s.strip()]
-        _turso_client().batch(stmts)
+        self._conn.executescript(script)
 
     def commit(self):
-        pass
+        self._conn.commit()
 
     def close(self):
-        pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
 
 def get_conn():

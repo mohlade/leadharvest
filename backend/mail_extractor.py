@@ -805,7 +805,7 @@ def is_search_stopped(search_id: str) -> bool:
         return False
 
 
-def run_search(search_id: str, role: str, location: str, country: str = "US", max_pages: int = 20, personal_only: bool = False, time_budget: float | None = None):
+def run_search(search_id: str, role: str, location: str, country: str = "US", max_pages: int = 20, personal_only: bool = False, time_budget: float | None = None, on_state=None):
     found: dict[str, dict] = {}
     pages_checked = 0
     source_map: dict[str, dict] = {}
@@ -820,10 +820,15 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
     def time_up() -> bool:
         return search_deadline is not None and time.monotonic() >= search_deadline
 
+    def _notify(status=None, pages_checked=None, emails_found=None, message=None):
+        """Persist progress and stream it to a live UI via on_state()."""
+        update_search(search_id, status=status, pages_checked=pages_checked, emails_found=emails_found, message=message)
+        if on_state:
+            on_state(status=status, pages_checked=pages_checked, emails_found=emails_found, message=message)
+
     try:
         if not any(google_cse_keys()) and not tavily_api_key() and not serper_api_key():
-            update_search(
-                search_id,
+            _notify(
                 status="failed",
                 message=(
                     "No search backend configured. Add a free search key to your .env, then retry:\n"
@@ -903,7 +908,7 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                             continue
                         visited.add(url)
                         _process_site(url, client)
-                        update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
+                        _notify(pages_checked=pages_checked, emails_found=len(found))
                         time.sleep(POLITENESS_DELAY)
 
                     # --- Harvest emails directly from search snippets (catches directory listings) ---
@@ -921,24 +926,24 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                                     "from_mailto": False,
                                 }
                                 source_map[em] = {"source_url": item.get("url", "")}
-                        update_search(search_id, emails_found=len(found))
+                        _notify(emails_found=len(found))
 
             # --- Retry failed sites once with a longer timeout ---
             if failed_urls and not is_search_stopped(search_id) and not time_up():
-                update_search(search_id, message=f"Retrying {len(failed_urls)} failed sites…")
+                _notify(message=f"Retrying {len(failed_urls)} failed sites…")
                 for url in list(failed_urls):
                     if pages_checked >= max_pages or is_search_stopped(search_id) or time_up():
                         break
                     _process_site(url, client, retry=True)
-                    update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
+                    _notify(pages_checked=pages_checked, emails_found=len(found))
                     time.sleep(POLITENESS_DELAY)
-                update_search(search_id, message="")
+                _notify(message="")
 
         if is_search_stopped(search_id):
             # User cancelled early — save whatever found so far and mark stopped
             validated = [_heuristic(e) for e in found.values()]
             saved = save_contacts(search_id, validated, source_map, personal_only=personal_only)
-            update_search(search_id, status="stopped", message=f"Search stopped by user. {saved} contacts saved.")
+            _notify(status="stopped", message=f"Search stopped by user. {saved} contacts saved.")
             return
 
         # AI verification (skipped only if the entire budget is already spent)
@@ -946,10 +951,10 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
             validated = [_heuristic(e) for e in found.values()]
             ai_used = False
         else:
-            update_search(search_id, message=f"Verifying {len(found)} emails with AI...")
+            _notify(message=f"Verifying {len(found)} emails with AI...")
             def _on_progress(done_chunks, total_chunks):
                 if not is_search_stopped(search_id):
-                    update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
+                    _notify(message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
 
             validated, ai_used = validate_with_openai(list(found.values()), role, location, progress_callback=_on_progress, deadline=deadline)
 
@@ -957,13 +962,15 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
 
         if time_budget and time.monotonic() >= deadline:
             final_message = f"Time limit reached after scanning {pages_checked} pages — results may be partial."
+        elif len(found) == 0:
+            final_message = ""
         elif not ai_used:
             final_message = "AI verification unavailable (missing or rate-limited API key) — heuristic scores used."
         else:
             final_message = ""
 
         final_status = "stopped" if is_search_stopped(search_id) else "done"
-        update_search(search_id, status=final_status, emails_found=saved, message=final_message)
+        _notify(status=final_status, emails_found=saved, message=final_message)
     except Exception:
-        update_search(search_id, status="failed")
+        _notify(status="failed")
         raise
