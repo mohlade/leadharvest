@@ -558,7 +558,7 @@ def _openai_extract(raw: dict) -> dict:
     }
 
 
-def validate_with_openai(entries: list[dict], role: str, location: str) -> list[dict]:
+def validate_with_openai(entries: list[dict], role: str, location: str, progress_callback=None) -> list[dict]:
     provider, key, base_url, model = ai_config()
     if not key or not entries:
         return [_heuristic(entry) for entry in entries]
@@ -588,10 +588,16 @@ def validate_with_openai(entries: list[dict], role: str, location: str) -> list[
         ),
     }
 
+    chunk_size = 40
+    chunks = [entries[i : i + chunk_size] for i in range(0, len(entries), chunk_size)]
+    total_chunks = len(chunks)
+    completed_chunks = 0
+    results_lock = threading.Lock()
     results = []
-    chunk_size = 25
-    for i in range(0, len(entries), chunk_size):
-        chunk = entries[i : i + chunk_size]
+
+    def _process_chunk(chunk: list[dict]) -> list[dict]:
+        nonlocal completed_chunks
+        chunk_results = []
         user_content = {
             "role": "user",
             "content": (
@@ -602,6 +608,7 @@ def validate_with_openai(entries: list[dict], role: str, location: str) -> list[
                 )
             ),
         }
+
         def _call(payload: dict):
             resp = httpx.post(
                 endpoint,
@@ -610,7 +617,7 @@ def validate_with_openai(entries: list[dict], role: str, location: str) -> list[
                     "Content-Type": "application/json",
                 },
                 json=payload,
-                timeout=60.0,
+                timeout=45.0,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -648,15 +655,26 @@ def validate_with_openai(entries: list[dict], role: str, location: str) -> list[
             for raw in verdicts:
                 entry = _openai_extract(raw)
                 if entry["email"]:
-                    results.append(entry)
+                    chunk_results.append(entry)
                     covered.add(entry["email"])
 
             for e in chunk:
                 if normalize_email(e["email"]) not in covered:
-                    results.append(_heuristic(e))
+                    chunk_results.append(_heuristic(e))
         except Exception:
-            results.extend(_heuristic(e) for e in chunk)
-        time.sleep(0.2)
+            chunk_results.extend(_heuristic(e) for e in chunk)
+
+        with results_lock:
+            completed_chunks += 1
+            if progress_callback:
+                progress_callback(completed_chunks, total_chunks)
+        return chunk_results
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_process_chunk, c) for c in chunks]
+        for f in futures:
+            results.extend(f.result())
 
     return results
 
@@ -862,9 +880,13 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                     time.sleep(POLITENESS_DELAY)
                 update_search(search_id, message=None)
 
-        validated = validate_with_openai(list(found.values()), role, location)
+        update_search(search_id, message=f"Verifying {len(found)} emails with AI...")
+        def _on_progress(done_chunks, total_chunks):
+            update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
+
+        validated = validate_with_openai(list(found.values()), role, location, progress_callback=_on_progress)
         save_contacts(search_id, validated, source_map, personal_only=personal_only)
-        update_search(search_id, status="done", emails_found=len(validated))
+        update_search(search_id, status="done", emails_found=len(validated), message=None)
     except Exception:
         update_search(search_id, status="failed")
         raise
