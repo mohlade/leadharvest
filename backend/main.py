@@ -57,6 +57,22 @@ def start_search(req: SearchRequest):
     return {"search_id": search_id, "status": "running"}
 
 
+@app.post("/api/contacts/search/{search_id}/stop")
+def stop_search(search_id: str):
+    conn = get_conn()
+    search = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
+    if not search:
+        conn.close()
+        return {"error": "search not found"}
+    conn.execute(
+        "UPDATE searches SET status = 'stopping', message = 'Stopping search and saving gathered contacts...' WHERE id = ?",
+        (search_id,),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "stopping"}
+
+
 @app.get("/api/contacts/search/{search_id}")
 def get_search(search_id: str):
     conn = get_conn()

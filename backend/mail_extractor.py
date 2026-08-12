@@ -778,6 +778,16 @@ def save_contacts(search_id: str, validated: list[dict], source_map: dict, perso
     conn.close()
 
 
+def is_search_stopped(search_id: str) -> bool:
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT status FROM searches WHERE id = ?", (search_id,)).fetchone()
+        conn.close()
+        return bool(row and row["status"] in ("stopping", "stopped", "cancelled"))
+    except Exception:
+        return False
+
+
 def run_search(search_id: str, role: str, location: str, country: str = "US", max_pages: int = 20, personal_only: bool = False):
     found: dict[str, dict] = {}
     pages_checked = 0
@@ -832,10 +842,10 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
 
         with httpx.Client(headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
             for query in queries:
-                if pages_checked >= max_pages:
+                if pages_checked >= max_pages or is_search_stopped(search_id):
                     break
                 for page in range(1, MAX_RESULT_PAGES + 1):
-                    if pages_checked >= max_pages:
+                    if pages_checked >= max_pages or is_search_stopped(search_id):
                         break
                     try:
                         urls = search_web(query, client, page=page)
@@ -844,7 +854,7 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                     if not urls:
                         break
                     for url in urls:
-                        if pages_checked >= max_pages:
+                        if pages_checked >= max_pages or is_search_stopped(search_id):
                             break
                         if url in visited:
                             continue
@@ -854,7 +864,7 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                         time.sleep(POLITENESS_DELAY)
 
                     # --- Harvest emails directly from Tavily snippets (catches directory listings) ---
-                    if tavily_api_key():
+                    if tavily_api_key() and not is_search_stopped(search_id):
                         try:
                             for (em, src_url, src_title) in harvest_emails_from_tavily(query, client):
                                 if em not in found:
@@ -870,23 +880,33 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                             pass
 
             # --- Retry failed sites once with a longer timeout ---
-            if failed_urls:
+            if failed_urls and not is_search_stopped(search_id):
                 update_search(search_id, message=f"Retrying {len(failed_urls)} failed sites…")
                 for url in list(failed_urls):
-                    if pages_checked >= max_pages:
+                    if pages_checked >= max_pages or is_search_stopped(search_id):
                         break
                     _process_site(url, client, retry=True)
                     update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
                     time.sleep(POLITENESS_DELAY)
                 update_search(search_id, message=None)
 
+        if is_search_stopped(search_id):
+            # User cancelled early — save whatever found so far and mark stopped
+            validated = [_heuristic(e) for e in found.values()]
+            save_contacts(search_id, validated, source_map, personal_only=personal_only)
+            update_search(search_id, status="stopped", message="Search stopped by user. Contacts saved.")
+            return
+
         update_search(search_id, message=f"Verifying {len(found)} emails with AI...")
         def _on_progress(done_chunks, total_chunks):
-            update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
+            if not is_search_stopped(search_id):
+                update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
 
         validated = validate_with_openai(list(found.values()), role, location, progress_callback=_on_progress)
         save_contacts(search_id, validated, source_map, personal_only=personal_only)
-        update_search(search_id, status="done", emails_found=len(validated), message=None)
+
+        final_status = "stopped" if is_search_stopped(search_id) else "done"
+        update_search(search_id, status=final_status, emails_found=len(validated), message=None)
     except Exception:
         update_search(search_id, status="failed")
         raise

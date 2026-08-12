@@ -347,6 +347,16 @@ export default function App() {
     loadActive(id);
   };
 
+  const stopSearch = async () => {
+    if (!active?.search_id) return;
+    try {
+      await fetch(`${API_URL}/api/contacts/search/${active.search_id}/stop`, { method: 'POST' });
+      loadActive(active.search_id);
+    } catch {
+      setError('Could not stop search');
+    }
+  };
+
   const busy = (active && active.status === 'running') || bulkQueue.some((q) => q.status === 'running');
 
   const csvUrl = active
@@ -424,6 +434,19 @@ export default function App() {
                 </svg>
                 Copy all
               </button>
+              {active.status === 'running' && (
+                <button
+                  id="btn-stop-search"
+                  className="btn btn-sm"
+                  style={{ background: 'rgba(239,68,68,0.15)', color: '#f87171', border: '1px solid rgba(239,68,68,0.3)' }}
+                  onClick={stopSearch}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                  Stop &amp; Save
+                </button>
+              )}
               <a id="btn-export-csv" href={csvUrl} download className="btn btn-ghost btn-sm">
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
