@@ -52,14 +52,17 @@ def start_search(req: SearchRequest):
 
     if os.getenv("VERCEL"):
         # On Vercel serverless, run fast search synchronously within function timeout (max 5 pages)
-        run_search(
-            search_id,
-            req.role.strip(),
-            req.location.strip(),
-            req.country,
-            min(req.max_pages, 5),
-            req.personal_only,
-        )
+        try:
+            run_search(
+                search_id,
+                req.role.strip(),
+                req.location.strip(),
+                req.country,
+                min(req.max_pages, 5),
+                req.personal_only,
+            )
+        except Exception:
+            pass  # run_search already marks the search as failed; return its state below
         conn = get_conn()
         search = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
         rows = conn.execute(

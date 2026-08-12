@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -728,7 +729,9 @@ def update_search(search_id: str, pages_checked: int = None, emails_found: int =
         args.append(status)
         if status in ("done", "failed"):
             sets.append("finished_at = datetime('now')")
-    if message is not None:
+    if message == "":
+        sets.append("message = NULL")
+    elif message is not None:
         sets.append("message = ?")
         args.append(message)
     if sets:
@@ -888,7 +891,7 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                     _process_site(url, client, retry=True)
                     update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
                     time.sleep(POLITENESS_DELAY)
-                update_search(search_id, message=None)
+                update_search(search_id, message="")
 
         if is_search_stopped(search_id):
             # User cancelled early — save whatever found so far and mark stopped
@@ -906,7 +909,7 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
         save_contacts(search_id, validated, source_map, personal_only=personal_only)
 
         final_status = "stopped" if is_search_stopped(search_id) else "done"
-        update_search(search_id, status=final_status, emails_found=len(validated), message=None)
+        update_search(search_id, status=final_status, emails_found=len(validated), message="")
     except Exception:
         update_search(search_id, status="failed")
         raise
