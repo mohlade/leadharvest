@@ -284,6 +284,11 @@ export default function App() {
         body: JSON.stringify(payload),
       });
       const data = await res.json();
+      if (data.contacts) {
+        setActive(data);
+        refreshHistory();
+        return;
+      }
       clearInterval(pollRef.current);
       pollRef.current = setInterval(() => loadActive(data.search_id), 2000);
       loadActive(data.search_id);
@@ -313,6 +318,14 @@ export default function App() {
         const startData = await res.json();
         const sid = startData.search_id;
 
+        if (startData.contacts) {
+          bulkRef.current = bulkRef.current.map((q, idx) =>
+            idx === i ? { ...q, status: startData.status, emails_found: startData.emails_found, search_id: sid } : q
+          );
+          setBulkQueue([...bulkRef.current]);
+          continue;
+        }
+
         // poll until done
         await new Promise((resolve) => {
           const iv = setInterval(async () => {
@@ -323,7 +336,7 @@ export default function App() {
                 idx === i ? { ...q, status: d.status, emails_found: d.emails_found, search_id: sid } : q
               );
               setBulkQueue([...bulkRef.current]);
-              if (d.status === 'done' || d.status === 'failed') {
+              if (d.status === 'done' || d.status === 'failed' || d.status === 'stopped') {
                 clearInterval(iv);
                 resolve();
               }
@@ -350,8 +363,14 @@ export default function App() {
   const stopSearch = async () => {
     if (!active?.search_id) return;
     try {
-      await fetch(`${API_URL}/api/contacts/search/${active.search_id}/stop`, { method: 'POST' });
-      loadActive(active.search_id);
+      const res  = await fetch(`${API_URL}/api/contacts/search/${active.search_id}/stop`, { method: 'POST' });
+      const data = await res.json();
+      if (data.contacts) {
+        setActive(data);
+        refreshHistory();
+      } else {
+        loadActive(active.search_id);
+      }
     } catch {
       setError('Could not stop search');
     }

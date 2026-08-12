@@ -48,6 +48,34 @@ class SearchRequest(BaseModel):
 def start_search(req: SearchRequest):
     search_id = uuid.uuid4().hex
     init_search(search_id, req.role.strip(), req.location.strip())
+
+    if os.getenv("VERCEL"):
+        # On Vercel serverless, run synchronously within function timeout
+        run_search(
+            search_id,
+            req.role.strip(),
+            req.location.strip(),
+            req.country,
+            min(req.max_pages, 20),
+            req.personal_only,
+        )
+        conn = get_conn()
+        search = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM contacts WHERE search_id = ? ORDER BY confidence DESC", (search_id,)
+        ).fetchall()
+        conn.close()
+        return {
+            "search_id": search_id,
+            "role": req.role.strip(),
+            "location": req.location.strip(),
+            "status": search["status"] if search else "done",
+            "pages_checked": search["pages_checked"] if search else 0,
+            "emails_found": search["emails_found"] if search else len(rows),
+            "message": search["message"] if search else None,
+            "contacts": [dict(row) for row in rows],
+        }
+
     thread = threading.Thread(
         target=run_search,
         args=(search_id, req.role.strip(), req.location.strip(), req.country, req.max_pages, req.personal_only),
@@ -65,12 +93,24 @@ def stop_search(search_id: str):
         conn.close()
         return {"error": "search not found"}
     conn.execute(
-        "UPDATE searches SET status = 'stopping', message = 'Stopping search and saving gathered contacts...' WHERE id = ?",
+        "UPDATE searches SET status = 'stopped', message = 'Search stopped by user' WHERE id = ?",
         (search_id,),
     )
     conn.commit()
+    rows = conn.execute(
+        "SELECT * FROM contacts WHERE search_id = ? ORDER BY confidence DESC", (search_id,)
+    ).fetchall()
     conn.close()
-    return {"status": "stopping"}
+    return {
+        "search_id": search_id,
+        "role": search["role"],
+        "location": search["location"],
+        "status": "stopped",
+        "pages_checked": search["pages_checked"],
+        "emails_found": len(rows),
+        "message": "Search stopped by user",
+        "contacts": [dict(r) for r in rows],
+    }
 
 
 @app.get("/api/contacts/search/{search_id}")
