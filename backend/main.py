@@ -52,15 +52,20 @@ def start_search(req: SearchRequest):
     init_search(search_id, req.role.strip(), req.location.strip())
 
     if os.getenv("VERCEL"):
-        # On Vercel serverless, run fast search synchronously within function timeout (max 5 pages)
+        # On Vercel serverless the whole search runs synchronously inside this one
+        # request. Hobby functions (fluid compute) allow up to 300s, so instead of a
+        # tiny page cap we budget wall-clock time: scan as deep as possible until the
+        # budget elapses (SEARCH_TIME_BUDGET, seconds). max_pages still applies as an
+        # upper bound. Set a lower SEARCH_TIME_BUDGET if you see function timeouts.
         try:
             run_search(
                 search_id,
                 req.role.strip(),
                 req.location.strip(),
                 req.country,
-                min(req.max_pages, 5),
+                req.max_pages,
                 req.personal_only,
+                time_budget=int(os.getenv("SEARCH_TIME_BUDGET", "240")),
             )
         except Exception:
             pass  # run_search already marks the search as failed; return its state below

@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -36,7 +36,7 @@ BLOCKED_DOMAINS = {
     "yourcompany.com", "mycompany.com", "yourbusiness.com", "yoursite.com",
     "mysite.com", "mywebsite.com", "yourname.com", "samples.com", "sample.com",
     "domain.com", "domain.net", "domain.org", "test.com", "test.org", "test.net",
-    "email.com", "emails.com", "mail.com", "mailinator.com", "placeholder.com",
+    "email.com", "emails.com", "mailinator.com", "placeholder.com",
     "website.com", "website.org", "brand.com", "company.com", "sentry.io",
     "wixpress.com", "sentry-next.wixpress.com", "staticflickr.com", "shutterstock.com",
     "gettyimages.com", "adobestock.com", "istockphoto.com", "dreamstime.com",
@@ -49,7 +49,7 @@ BLOCKED_DOMAINS = {
     "useloom.com", "calendly.com", "typeform.com", "disqus.com", "mailerlite.com",
     "vimeo.com", "dribbble.com", "behance.net", "medium.com", "wordpress.org",
     "w3.org", "schema.org", "mozilla.org", "apache.org", "opensource.org",
-    "yandex.ru", "yahoo.com", "aol.com", "microsoft.com", "apple.com",
+    "yandex.ru", "microsoft.com", "apple.com",
     "amazonaws.com", "vercel.app", "netlify.com", "surge.sh", "pages.dev",
     "github.com", "gitlab.com", "bitbucket.org", "npmjs.com", "sentry.link",
 }
@@ -166,6 +166,8 @@ def is_plausible(email: str) -> bool:
 
 def deobfuscate(text: str) -> str:
     text = re.sub(r"&#64;|&#x40;|&commat;|&COMMAT;", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"%40", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"%2e", ".", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*\[at\]\s*", "@", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*\(at\)\s*", "@", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+at\s+", "@", text, flags=re.IGNORECASE)
@@ -174,6 +176,16 @@ def deobfuscate(text: str) -> str:
     text = re.sub(r"\s*\(dot\)\s*", ".", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+dot\s+", ".", text, flags=re.IGNORECASE)
     return text
+
+
+def candidate_email(candidate: str) -> str | None:
+    """Normalize a raw email match; strip URL-encoded junk (%20 etc.) and return
+    the clean address, or None if it is not a usable email."""
+    cleaned = re.sub(r"\s+", "", normalize_email(unquote(candidate)))
+    if cleaned != normalize_email(candidate):
+        candidate = cleaned
+    candidate = normalize_email(candidate)
+    return candidate if is_plausible(candidate) else None
 
 
 def decode_cfemail(hex_str: str):
@@ -214,8 +226,9 @@ def extract_emails(html: str) -> list[str]:
 
     text = deobfuscate(soup.get_text(" ", strip=True))
     for candidate in EMAIL_RE.findall(text):
-        if is_plausible(candidate):
-            emails.add(normalize_email(candidate))
+        clean = candidate_email(candidate)
+        if clean:
+            emails.add(clean)
 
     return sorted(emails)
 
@@ -476,23 +489,6 @@ def _tavily_results(query: str, client: httpx.Client) -> list[dict]:
     return resp.json().get("results", [])
 
 
-def harvest_emails_from_tavily(query: str, client: httpx.Client) -> list[tuple[str, str, str]]:
-    """Returns list of (email, url, title) harvested directly from Tavily snippets."""
-    results = []
-    try:
-        for item in _tavily_results(query, client):
-            url = item.get("url", "")
-            title = item.get("title", "")
-            content = item.get("content", "") or ""
-            text = deobfuscate(content)
-            for candidate in EMAIL_RE.findall(text):
-                if is_plausible(candidate):
-                    results.append((normalize_email(candidate), url, title))
-    except Exception:
-        pass
-    return results
-
-
 def search_google_cse(query: str, client: httpx.Client, page: int = 1) -> list[str]:
     cse_id, api_key = google_cse_keys()
     resp = client.get(
@@ -559,10 +555,10 @@ def _openai_extract(raw: dict) -> dict:
     }
 
 
-def validate_with_openai(entries: list[dict], role: str, location: str, progress_callback=None) -> list[dict]:
+def validate_with_openai(entries: list[dict], role: str, location: str, progress_callback=None, deadline: float | None = None):
     provider, key, base_url, model = ai_config()
     if not key or not entries:
-        return [_heuristic(entry) for entry in entries]
+        return [_heuristic(entry) for entry in entries], False
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
 
     prompt = {
@@ -595,10 +591,19 @@ def validate_with_openai(entries: list[dict], role: str, location: str, progress
     completed_chunks = 0
     results_lock = threading.Lock()
     results = []
+    ai_used_flags: list[bool] = []
 
     def _process_chunk(chunk: list[dict]) -> list[dict]:
         nonlocal completed_chunks
         chunk_results = []
+        used = False
+        if deadline is not None and time.monotonic() >= deadline:
+            chunk_results.extend(_heuristic(e) for e in chunk)
+            with results_lock:
+                completed_chunks += 1
+                if progress_callback:
+                    progress_callback(completed_chunks, total_chunks)
+            return chunk_results
         user_content = {
             "role": "user",
             "content": (
@@ -652,6 +657,7 @@ def validate_with_openai(entries: list[dict], role: str, location: str, progress
             if isinstance(parsed, list):
                 parsed = {"results": parsed}
             verdicts = (parsed or {}).get("results") or []
+            used = bool(verdicts)
             covered = set()
             for raw in verdicts:
                 entry = _openai_extract(raw)
@@ -667,6 +673,7 @@ def validate_with_openai(entries: list[dict], role: str, location: str, progress
 
         with results_lock:
             completed_chunks += 1
+            ai_used_flags.append(used)
             if progress_callback:
                 progress_callback(completed_chunks, total_chunks)
         return chunk_results
@@ -677,7 +684,7 @@ def validate_with_openai(entries: list[dict], role: str, location: str, progress
         for f in futures:
             results.extend(f.result())
 
-    return results
+    return results, any(ai_used_flags)
 
 
 def _heuristic(entry: dict) -> dict:
@@ -741,8 +748,9 @@ def update_search(search_id: str, pages_checked: int = None, emails_found: int =
     conn.close()
 
 
-def save_contacts(search_id: str, validated: list[dict], source_map: dict, personal_only: bool = True):
+def save_contacts(search_id: str, validated: list[dict], source_map: dict, personal_only: bool = True) -> int:
     conn = get_conn()
+    saved = 0
     for v in validated:
         if not v.get("valid"):
             continue
@@ -781,8 +789,10 @@ def save_contacts(search_id: str, validated: list[dict], source_map: dict, perso
                 first_seen_search_id,
             ),
         )
+        saved += 1
     conn.commit()
     conn.close()
+    return saved
 
 
 def is_search_stopped(search_id: str) -> bool:
@@ -795,12 +805,20 @@ def is_search_stopped(search_id: str) -> bool:
         return False
 
 
-def run_search(search_id: str, role: str, location: str, country: str = "US", max_pages: int = 20, personal_only: bool = False):
+def run_search(search_id: str, role: str, location: str, country: str = "US", max_pages: int = 20, personal_only: bool = False, time_budget: float | None = None):
     found: dict[str, dict] = {}
     pages_checked = 0
     source_map: dict[str, dict] = {}
     visited: set[str] = set()
     failed_urls: set[str] = set()   # Sites that errored — will be retried once
+    deadline = time.monotonic() + time_budget if time_budget else None
+    # Reserve time for AI verification so the whole run (search + validation)
+    # stays inside the platform function timeout. Never reserve more than 25%.
+    reserve = min(45.0, time_budget * 0.25) if time_budget else 0.0
+    search_deadline = deadline - reserve if deadline else None
+
+    def time_up() -> bool:
+        return search_deadline is not None and time.monotonic() >= search_deadline
 
     try:
         if not any(google_cse_keys()) and not tavily_api_key() and not serper_api_key():
@@ -848,20 +866,38 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                         source_map[e] = {"source_url": purl}
 
         with httpx.Client(headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+            # Tavily has no pagination — requesting page 2+ returns the same results,
+            # burning quota and time. Only paginate when using a paginated provider.
+            tavily_active = bool(tavily_api_key()) and not any(google_cse_keys()) and not serper_api_key()
+            max_result_pages = 1 if tavily_active else MAX_RESULT_PAGES
+
             for query in queries:
-                if pages_checked >= max_pages or is_search_stopped(search_id):
+                if pages_checked >= max_pages or is_search_stopped(search_id) or time_up():
                     break
-                for page in range(1, MAX_RESULT_PAGES + 1):
-                    if pages_checked >= max_pages or is_search_stopped(search_id):
+                for page in range(1, max_result_pages + 1):
+                    if pages_checked >= max_pages or is_search_stopped(search_id) or time_up():
                         break
-                    try:
-                        urls = search_web(query, client, page=page)
-                    except Exception:
-                        urls = []
-                    if not urls:
+
+                    tavily_items = None
+                    if tavily_active:
+                        # Single Tavily call per query: URLs for crawling + snippet
+                        # harvesting come from the same response (saves free quota).
+                        try:
+                            tavily_items = _tavily_results(query, client)
+                            urls = [item.get("url") for item in tavily_items if item.get("url")]
+                        except Exception:
+                            urls = []
+                    else:
+                        try:
+                            urls = search_web(query, client, page=page)
+                        except Exception:
+                            urls = []
+
+                    if not urls and not tavily_items:
                         break
+
                     for url in urls:
-                        if pages_checked >= max_pages or is_search_stopped(search_id):
+                        if pages_checked >= max_pages or is_search_stopped(search_id) or time_up():
                             break
                         if url in visited:
                             continue
@@ -870,27 +906,28 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
                         update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
                         time.sleep(POLITENESS_DELAY)
 
-                    # --- Harvest emails directly from Tavily snippets (catches directory listings) ---
-                    if tavily_api_key() and not is_search_stopped(search_id):
-                        try:
-                            for (em, src_url, src_title) in harvest_emails_from_tavily(query, client):
-                                if em not in found:
-                                    found[em] = {
-                                        "email": em,
-                                        "source_url": src_url,
-                                        "page_title": src_title,
-                                        "from_mailto": False,
-                                    }
-                                    source_map[em] = {"source_url": src_url}
-                            update_search(search_id, emails_found=len(found))
-                        except Exception:
-                            pass
+                    # --- Harvest emails directly from search snippets (catches directory listings) ---
+                    if tavily_items and not is_search_stopped(search_id) and not time_up():
+                        for item in tavily_items:
+                            snippet = deobfuscate(item.get("content", "") or "")
+                            for candidate in EMAIL_RE.findall(snippet):
+                                em = candidate_email(candidate)
+                                if not em or em in found:
+                                    continue
+                                found[em] = {
+                                    "email": em,
+                                    "source_url": item.get("url", ""),
+                                    "page_title": item.get("title", ""),
+                                    "from_mailto": False,
+                                }
+                                source_map[em] = {"source_url": item.get("url", "")}
+                        update_search(search_id, emails_found=len(found))
 
             # --- Retry failed sites once with a longer timeout ---
-            if failed_urls and not is_search_stopped(search_id):
+            if failed_urls and not is_search_stopped(search_id) and not time_up():
                 update_search(search_id, message=f"Retrying {len(failed_urls)} failed sites…")
                 for url in list(failed_urls):
-                    if pages_checked >= max_pages or is_search_stopped(search_id):
+                    if pages_checked >= max_pages or is_search_stopped(search_id) or time_up():
                         break
                     _process_site(url, client, retry=True)
                     update_search(search_id, pages_checked=pages_checked, emails_found=len(found))
@@ -900,20 +937,33 @@ def run_search(search_id: str, role: str, location: str, country: str = "US", ma
         if is_search_stopped(search_id):
             # User cancelled early — save whatever found so far and mark stopped
             validated = [_heuristic(e) for e in found.values()]
-            save_contacts(search_id, validated, source_map, personal_only=personal_only)
-            update_search(search_id, status="stopped", message="Search stopped by user. Contacts saved.")
+            saved = save_contacts(search_id, validated, source_map, personal_only=personal_only)
+            update_search(search_id, status="stopped", message=f"Search stopped by user. {saved} contacts saved.")
             return
 
-        update_search(search_id, message=f"Verifying {len(found)} emails with AI...")
-        def _on_progress(done_chunks, total_chunks):
-            if not is_search_stopped(search_id):
-                update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
+        # AI verification (skipped only if the entire budget is already spent)
+        if time_budget and time.monotonic() >= deadline:
+            validated = [_heuristic(e) for e in found.values()]
+            ai_used = False
+        else:
+            update_search(search_id, message=f"Verifying {len(found)} emails with AI...")
+            def _on_progress(done_chunks, total_chunks):
+                if not is_search_stopped(search_id):
+                    update_search(search_id, message=f"Verifying emails with AI ({done_chunks}/{total_chunks} batches)...")
 
-        validated = validate_with_openai(list(found.values()), role, location, progress_callback=_on_progress)
-        save_contacts(search_id, validated, source_map, personal_only=personal_only)
+            validated, ai_used = validate_with_openai(list(found.values()), role, location, progress_callback=_on_progress, deadline=deadline)
+
+        saved = save_contacts(search_id, validated, source_map, personal_only=personal_only)
+
+        if time_budget and time.monotonic() >= deadline:
+            final_message = f"Time limit reached after scanning {pages_checked} pages — results may be partial."
+        elif not ai_used:
+            final_message = "AI verification unavailable (missing or rate-limited API key) — heuristic scores used."
+        else:
+            final_message = ""
 
         final_status = "stopped" if is_search_stopped(search_id) else "done"
-        update_search(search_id, status=final_status, emails_found=len(validated), message="")
+        update_search(search_id, status=final_status, emails_found=saved, message=final_message)
     except Exception:
         update_search(search_id, status="failed")
         raise
