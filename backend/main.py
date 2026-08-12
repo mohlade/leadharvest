@@ -9,6 +9,7 @@ from typing import Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from database import get_conn, init_db
@@ -192,3 +193,11 @@ def export_csv(search_id: Optional[str] = Query(default=None, description="Searc
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=contacts.csv"},
     )
+
+
+# Serve the built SPA if present (Docker image). Mounted last so /api/* routes
+# above always win; local dev (frontend on :3000) is unaffected since the
+# dist directory does not exist on the host.
+FRONTEND_DIST = os.getenv("FRONTEND_DIST", "/app/frontend/dist")
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="spa")
