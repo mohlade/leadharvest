@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -50,13 +51,13 @@ def start_search(req: SearchRequest):
     init_search(search_id, req.role.strip(), req.location.strip())
 
     if os.getenv("VERCEL"):
-        # On Vercel serverless, run synchronously within function timeout
+        # On Vercel serverless, run fast search synchronously within function timeout (max 5 pages)
         run_search(
             search_id,
             req.role.strip(),
             req.location.strip(),
             req.country,
-            min(req.max_pages, 20),
+            min(req.max_pages, 5),
             req.personal_only,
         )
         conn = get_conn()
